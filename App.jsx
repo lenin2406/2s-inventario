@@ -19,12 +19,21 @@ import {
   RefreshCcw,
   Pencil,
   Trash2,
-  X
+  X,
+  Search,
+  History
 } from 'lucide-react';
 
 const AREAS = ['CAVA', 'DOS SUCRES', 'MINDALA'];
 const SUBCATEGORIAS = ['Espumosos', 'Blancos', 'Naranjos', 'Tintos', 'Rosados', 'Licores', 'Cervezas', 'Insumos', 'Menaje', 'Otros'];
 const STORAGE_KEY = 'inventario-bar-state-v1';
+
+// ---------- Conversión de volumen (botellas/tragos <-> ml/oz) ----------
+// Botella estándar de licor = 750 ml. El tamaño de trago es configurable
+// por el usuario porque varía según el bar (1 oz, 1.5 oz, etc.).
+const ML_PER_BOTTLE = 750;
+const ML_PER_OZ = 29.5735;
+const mlToOz = (ml) => ml / ML_PER_OZ;
 
 // ---------- FIX: generador de IDs seguro contra colisiones ----------
 // Antes se usaba Date.now() (y Date.now() + Math.random() en algún punto),
@@ -209,6 +218,23 @@ export default function InventarioApp() {
 
   const [selectedAreaFilter, setSelectedAreaFilter] = useState('TODAS');
 
+  // ---------- Editar o eliminar un movimiento del Kardex (corrección de errores de digitación) ----------
+  const [editingTx, setEditingTx] = useState(null);
+  const [editTxForm, setEditTxForm] = useState(null);
+  const [editTxItemSearch, setEditTxItemSearch] = useState('');
+
+  // ---------- Historial de Kardex por producto (con exportación a PDF) ----------
+  const [historyItem, setHistoryItem] = useState(null); // producto cuyo historial se está viendo (null = cerrado)
+
+  // ---------- Tabla de conversión ml/oz ----------
+  const [volumeUnit, setVolumeUnit] = useState('ml'); // 'ml' | 'oz'
+  const [shotSizeMl, setShotSizeMl] = useState(45); // tamaño de trago configurable (45ml ≈ 1.5oz por defecto)
+
+  // ---------- Búsqueda de productos ----------
+  const [productSearch, setProductSearch] = useState('');
+  const [transactionItemSearch, setTransactionItemSearch] = useState('');
+  const [writeOffItemSearch, setWriteOffItemSearch] = useState('');
+
   // ---------- Edición y eliminación de productos ----------
   const [editingItem, setEditingItem] = useState(null); // producto que se está editando (null = modal cerrado)
   const [editForm, setEditForm] = useState(null);        // valores del formulario de edición
@@ -249,6 +275,20 @@ export default function InventarioApp() {
 
   const getItemTotalStock = (item) => {
     return Number(((item.currentStock.CAVA || 0) + (item.currentStock['DOS SUCRES'] || 0) + (item.currentStock.MINDALA || 0)).toFixed(2));
+  };
+
+  // Convierte una cantidad de botellas a la unidad de volumen elegida (ml u oz)
+  const formatBottlesAsVolume = (bottles) => {
+    const totalMl = bottles * ML_PER_BOTTLE;
+    if (volumeUnit === 'oz') return `${mlToOz(totalMl).toFixed(1)} oz`;
+    return `${totalMl.toFixed(0)} ml`;
+  };
+
+  // Convierte una cantidad de tragos a la unidad de volumen elegida, según el tamaño de trago configurado
+  const formatShotsAsVolume = (shots) => {
+    const totalMl = shots * shotSizeMl;
+    if (volumeUnit === 'oz') return `${mlToOz(totalMl).toFixed(1)} oz`;
+    return `${totalMl.toFixed(0)} ml`;
   };
 
   const handleAddItem = (e) => {
@@ -569,6 +609,165 @@ export default function InventarioApp() {
 
     setItems(prev => prev.filter(i => i.id !== item.id));
     if (editingItem && editingItem.id === item.id) closeEditItem();
+  };
+
+  // ---------- Corregir un movimiento del Kardex por error de digitación ----------
+  // Editar un movimiento pasado implica "deshacer" su efecto original sobre el
+  // stock y luego "reaplicar" el efecto con los valores corregidos. Se hace
+  // sobre una copia del stock para poder validar (evitar negativos) antes de
+  // confirmar el cambio.
+  const openEditTx = (tx) => {
+    setEditingTx(tx);
+    setEditTxForm({ itemId: tx.itemId, area: tx.area, type: tx.type, quantity: tx.quantity, note: tx.note || '' });
+    setEditTxItemSearch('');
+  };
+
+  const closeEditTx = () => {
+    setEditingTx(null);
+    setEditTxForm(null);
+  };
+
+  const handleSaveEditTx = (e) => {
+    e.preventDefault();
+    if (!editingTx || !editTxForm) return;
+
+    const newQty = toSafeNumber(editTxForm.quantity, { min: 0.01 });
+    if (newQty === null) { alert('Cantidad inválida.'); return; }
+    if (!editTxForm.itemId) { alert('Selecciona un producto.'); return; }
+
+    const updatedItems = items.map(i => ({ ...i, currentStock: { ...i.currentStock } }));
+
+    // 1) Revertir el efecto del movimiento original
+    const oldItemIdx = updatedItems.findIndex(i => i.id === editingTx.itemId);
+    if (oldItemIdx !== -1) {
+      const reverseDelta = editingTx.type === 'IN' ? -editingTx.quantity : editingTx.quantity;
+      updatedItems[oldItemIdx].currentStock[editingTx.area] = Number(((updatedItems[oldItemIdx].currentStock[editingTx.area] || 0) + reverseDelta).toFixed(2));
+    }
+
+    // 2) Aplicar el efecto del movimiento corregido
+    const newItemIdx = updatedItems.findIndex(i => i.id === editTxForm.itemId);
+    if (newItemIdx === -1) { alert('El producto seleccionado ya no existe en el catálogo.'); return; }
+    const applyDelta = editTxForm.type === 'IN' ? newQty : -newQty;
+    const resultStock = Number(((updatedItems[newItemIdx].currentStock[editTxForm.area] || 0) + applyDelta).toFixed(2));
+    if (resultStock < 0) {
+      alert(`Esta corrección dejaría el stock en negativo en ${editTxForm.area} (resultaría en ${resultStock}). Ajusta la cantidad o el tipo de movimiento.`);
+      return;
+    }
+    updatedItems[newItemIdx].currentStock[editTxForm.area] = Math.max(0, resultStock);
+
+    setItems(updatedItems);
+    setTransactions(prev => prev.map(t => t.id === editingTx.id ? {
+      ...t,
+      itemId: editTxForm.itemId,
+      area: editTxForm.area,
+      type: editTxForm.type,
+      quantity: newQty,
+      isShotMode: false,
+      shotsCount: null,
+      note: `${editTxForm.note ? editTxForm.note : t.note} [Editado por ${operatorName} — corrección de digitación, ${new Date().toLocaleString('es-ES')}]`
+    } : t));
+
+    closeEditTx();
+  };
+
+  const handleDeleteTx = (tx) => {
+    if (!window.confirm('¿Eliminar este movimiento del Kardex? Se revertirá su efecto sobre el stock. Esta acción no se puede deshacer.')) return;
+
+    const updatedItems = items.map(i => ({ ...i, currentStock: { ...i.currentStock } }));
+    const itemIdx = updatedItems.findIndex(i => i.id === tx.itemId);
+    if (itemIdx !== -1) {
+      const reverseDelta = tx.type === 'IN' ? -tx.quantity : tx.quantity;
+      const resultStock = Number(((updatedItems[itemIdx].currentStock[tx.area] || 0) + reverseDelta).toFixed(2));
+      if (resultStock < 0) {
+        alert(`No se puede eliminar: dejaría el stock en negativo en ${tx.area} (resultaría en ${resultStock}). Es probable que haya movimientos posteriores que dependen de este.`);
+        return;
+      }
+      updatedItems[itemIdx].currentStock[tx.area] = Math.max(0, resultStock);
+      setItems(updatedItems);
+    }
+
+    setTransactions(prev => prev.filter(t => t.id !== tx.id));
+    if (editingTx && editingTx.id === tx.id) closeEditTx();
+  };
+
+  // ---------- Historial de Kardex por producto ----------
+  const getItemHistory = (itemId) => {
+    return transactions
+      .filter(t => t.itemId === itemId)
+      .slice()
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+  };
+
+  // Exporta el historial de un producto como PDF, usando el diálogo de
+  // impresión del navegador (Guardar como PDF) en una ventana aparte para no
+  // interferir con los estilos de la app.
+  const handleExportHistoryPDF = (item) => {
+    const history = getItemHistory(item.id);
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      alert('El navegador bloqueó la ventana emergente. Habilita las ventanas emergentes para exportar el PDF.');
+      return;
+    }
+
+    const rows = history.map(tx => `
+      <tr>
+        <td>${new Date(tx.date).toLocaleString('es-ES', { dateStyle: 'short', timeStyle: 'short' })}</td>
+        <td>${tx.area}</td>
+        <td style="color:${tx.type === 'IN' ? '#059669' : '#dc2626'}; font-weight:bold;">${tx.type === 'IN' ? 'ENTRADA' : 'SALIDA'}</td>
+        <td style="text-align:center;">${tx.type === 'IN' ? '+' : '-'}${tx.quantity} bot.${tx.isShotMode && tx.shotsCount ? ` (${tx.shotsCount} tragos)` : ''}</td>
+        <td>${tx.user || '—'}</td>
+        <td>${(tx.note || '').replace(/</g, '&lt;')}</td>
+      </tr>
+    `).join('');
+
+    const totalIn = history.filter(t => t.type === 'IN').reduce((s, t) => s + t.quantity, 0);
+    const totalOut = history.filter(t => t.type === 'OUT').reduce((s, t) => s + t.quantity, 0);
+
+    printWindow.document.write(`
+      <!doctype html>
+      <html lang="es">
+      <head>
+        <meta charset="utf-8" />
+        <title>Historial - ${item.name}</title>
+        <style>
+          body { font-family: Arial, Helvetica, sans-serif; padding: 24px; color: #1f2937; }
+          h1 { font-size: 18px; margin-bottom: 4px; }
+          .sub { color: #6b7280; font-size: 12px; margin-bottom: 16px; }
+          table { width: 100%; border-collapse: collapse; font-size: 11px; }
+          th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; }
+          th { background: #f3f4f6; }
+          .summary { margin-top: 16px; font-size: 12px; display: flex; gap: 24px; }
+          .summary b { display: block; font-size: 14px; }
+          @media print {
+            body { padding: 0; }
+          }
+        </style>
+      </head>
+      <body>
+        <h1>Historial de Movimientos — ${item.name}</h1>
+        <div class="sub">${item.subcategory} · Generado el ${new Date().toLocaleString('es-ES')}</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Fecha y Hora</th><th>Área</th><th>Tipo</th><th>Cantidad</th><th>Registrado por</th><th>Nota</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || '<tr><td colspan="6" style="text-align:center;color:#9ca3af;">Sin movimientos registrados</td></tr>'}
+          </tbody>
+        </table>
+        <div class="summary">
+          <div>Total Entradas <b style="color:#059669;">+${totalIn.toFixed(2)} bot.</b></div>
+          <div>Total Salidas <b style="color:#dc2626;">-${totalOut.toFixed(2)} bot.</b></div>
+          <div>Stock Actual <b>${getItemTotalStock(item)} bot.</b></div>
+        </div>
+      </body>
+      </html>
+    `);
+    printWindow.document.close();
+    printWindow.focus();
+    // Pequeño delay para que el navegador termine de pintar antes de abrir el diálogo de impresión
+    setTimeout(() => printWindow.print(), 300);
   };
 
   const lowStockItems = useMemo(() => {
@@ -957,14 +1156,50 @@ export default function InventarioApp() {
       </div>
 
       <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-        <div className="p-4 border-b border-gray-100 flex flex-col sm:flex-row justify-between items-center gap-4 bg-gray-50">
+        <div className="p-4 border-b border-gray-100 flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 bg-gray-50">
           <h2 className="text-lg font-bold text-gray-800 flex items-center"><Package className="mr-2" size={20} /> Existencias por Áreas de Trabajo</h2>
-          <div className="flex items-center space-x-2">
-            <Filter size={16} className="text-gray-500" />
-            <select value={selectedAreaFilter} onChange={e => setSelectedAreaFilter(e.target.value)} className="p-2 border rounded-xl text-sm outline-none bg-white">
-              <option value="TODAS">Todas las subcategorías</option>
-              {SUBCATEGORIAS.map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 w-full lg:w-auto">
+            <div className="relative w-full sm:w-56">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={productSearch}
+                onChange={e => setProductSearch(e.target.value)}
+                placeholder="Buscar producto..."
+                className="w-full pl-9 pr-3 py-2 border rounded-xl text-sm outline-none bg-white"
+              />
+            </div>
+            <div className="flex items-center space-x-2">
+              <Filter size={16} className="text-gray-500" />
+              <select value={selectedAreaFilter} onChange={e => setSelectedAreaFilter(e.target.value)} className="p-2 border rounded-xl text-sm outline-none bg-white">
+                <option value="TODAS">Todas las subcategorías</option>
+                {SUBCATEGORIAS.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="flex items-center space-x-2 bg-white border rounded-xl p-1">
+              <button
+                type="button"
+                onClick={() => setVolumeUnit('ml')}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${volumeUnit === 'ml' ? 'bg-blue-600 text-white' : 'text-gray-600'}`}
+              >ml</button>
+              <button
+                type="button"
+                onClick={() => setVolumeUnit('oz')}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${volumeUnit === 'oz' ? 'bg-blue-600 text-white' : 'text-gray-600'}`}
+              >oz</button>
+            </div>
+            <div className="flex items-center space-x-1.5">
+              <span className="text-xs text-gray-500 font-medium whitespace-nowrap">Trago =</span>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={shotSizeMl}
+                onChange={e => setShotSizeMl(toSafeNumber(e.target.value, { min: 1, fallback: shotSizeMl }))}
+                className="w-16 p-1.5 border rounded-lg text-xs font-mono bg-white"
+              />
+              <span className="text-xs text-gray-500">ml</span>
+            </div>
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -976,11 +1211,15 @@ export default function InventarioApp() {
                 <th className="p-4 font-semibold text-center bg-amber-50 text-amber-900">Dos Sucres</th>
                 <th className="p-4 font-semibold text-center bg-teal-50 text-teal-900">Mindala</th>
                 <th className="p-4 font-semibold text-center bg-blue-50 text-blue-900 font-bold">Total General</th>
+                <th className="p-4 font-semibold text-center bg-indigo-50 text-indigo-900">Volumen Total</th>
                 <th className="p-4 font-semibold text-center">Acciones</th>
               </tr>
             </thead>
             <tbody>
-              {items.filter(i => selectedAreaFilter === 'TODAS' || i.subcategory === selectedAreaFilter).map(item => {
+              {items
+                .filter(i => selectedAreaFilter === 'TODAS' || i.subcategory === selectedAreaFilter)
+                .filter(i => i.name.toLowerCase().includes(productSearch.trim().toLowerCase()))
+                .map(item => {
                 const total = getItemTotalStock(item);
                 return (
                   <tr key={item.id} className="border-b hover:bg-gray-50">
@@ -1011,10 +1250,25 @@ export default function InventarioApp() {
                     </td>
                     <td className="p-4 text-center bg-blue-50/20 font-extrabold text-blue-700 text-base">
                       {total} bot.
-                      {item.isFractional && <span className="block text-xs font-mono text-indigo-700 font-semibold">≈ {Math.round(total * item.shotsPerBottle)} tragos tot.</span>}
+                      {item.isFractional && (
+                        <span className="block text-xs font-mono text-indigo-700 font-semibold">
+                          ≈ {Math.round(total * item.shotsPerBottle)} tragos tot. ({shotSizeMl}ml c/u)
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-4 text-center bg-indigo-50/20">
+                      <span className="font-bold text-indigo-700 text-sm">{formatBottlesAsVolume(total)}</span>
+                      <span className="block text-[10px] text-gray-400">(botella = 750ml)</span>
                     </td>
                     <td className="p-4 text-center">
                       <div className="flex items-center justify-center space-x-2">
+                        <button
+                          onClick={() => setHistoryItem(item)}
+                          title="Ver historial de movimientos"
+                          className="p-2 rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition"
+                        >
+                          <History size={16} />
+                        </button>
                         <button
                           onClick={() => openEditItem(item)}
                           title="Editar producto"
@@ -1038,6 +1292,72 @@ export default function InventarioApp() {
           </table>
         </div>
       </div>
+
+      {historyItem && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white rounded-t-2xl gap-4">
+              <div>
+                <h2 className="text-lg font-bold text-gray-800 flex items-center"><History className="mr-2" size={20} /> Historial de Movimientos</h2>
+                <p className="text-sm text-gray-500 mt-0.5">{historyItem.name}</p>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => handleExportHistoryPDF(historyItem)}
+                  className="bg-gray-900 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center hover:bg-gray-800 transition whitespace-nowrap"
+                >
+                  <Printer size={16} className="mr-2" /> Exportar PDF
+                </button>
+                <button onClick={() => setHistoryItem(null)} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500">
+                  <X size={20} />
+                </button>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-sm">
+                <thead>
+                  <tr className="bg-gray-100 text-gray-600 border-b">
+                    <th className="p-3 font-semibold">Fecha y Hora</th>
+                    <th className="p-3 font-semibold">Área</th>
+                    <th className="p-3 font-semibold">Tipo</th>
+                    <th className="p-3 font-semibold text-center">Cantidad</th>
+                    <th className="p-3 font-semibold">Registrado por</th>
+                    <th className="p-3 font-semibold">Nota</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {getItemHistory(historyItem.id).map(tx => (
+                    <tr key={tx.id} className="border-b hover:bg-gray-50">
+                      <td className="p-3 text-xs text-gray-500">{new Date(tx.date).toLocaleString('es-ES', { dateStyle: 'short', timeStyle: 'short' })}</td>
+                      <td className="p-3">
+                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${
+                          tx.area === 'CAVA' ? 'bg-purple-100 text-purple-700' : tx.area === 'DOS SUCRES' ? 'bg-amber-100 text-amber-700' : 'bg-teal-100 text-teal-700'
+                        }`}>{tx.area}</span>
+                      </td>
+                      <td className="p-3">
+                        {tx.type === 'IN' ? (
+                          <span className="flex items-center text-xs font-bold text-emerald-700"><TrendingUp size={14} className="mr-1" /> Entrada</span>
+                        ) : (
+                          <span className="flex items-center text-xs font-bold text-red-700"><TrendingDown size={14} className="mr-1" /> Salida</span>
+                        )}
+                      </td>
+                      <td className={`p-3 text-center font-bold ${tx.type === 'IN' ? 'text-emerald-600' : 'text-red-600'}`}>
+                        {tx.type === 'IN' ? '+' : '-'}{tx.quantity} bot.
+                        {tx.isShotMode && tx.shotsCount && <span className="block text-xs font-normal text-indigo-600 font-mono">({tx.shotsCount} tragos)</span>}
+                      </td>
+                      <td className="p-3 text-xs text-gray-700 font-medium">{tx.user || '—'}</td>
+                      <td className="p-3 text-xs text-gray-600">{tx.note}</td>
+                    </tr>
+                  ))}
+                  {getItemHistory(historyItem.id).length === 0 && (
+                    <tr><td colSpan="6" className="p-8 text-center text-gray-500">Este producto no tiene movimientos registrados todavía.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {editingItem && editForm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
@@ -1183,9 +1503,21 @@ export default function InventarioApp() {
             </div>
             <div className="md:col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-1">Producto</label>
+              <div className="relative mb-1.5">
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  value={transactionItemSearch}
+                  onChange={e => setTransactionItemSearch(e.target.value)}
+                  placeholder="Filtrar productos..."
+                  className="w-full pl-8 pr-2 py-1.5 border rounded-lg text-xs outline-none bg-white"
+                />
+              </div>
               <select required value={newTransaction.itemId} onChange={e => setNewTransaction({...newTransaction, itemId: e.target.value})} className="w-full p-2.5 border rounded-xl outline-none bg-white">
                 <option value="" disabled>Seleccione producto o licor...</option>
-                {items.map(item => <option key={item.id} value={item.id}>{item.name} (Tot: {getItemTotalStock(item)} bot.)</option>)}
+                {items
+                  .filter(item => item.name.toLowerCase().includes(transactionItemSearch.trim().toLowerCase()))
+                  .map(item => <option key={item.id} value={item.id}>{item.name} (Tot: {getItemTotalStock(item)} bot.)</option>)}
               </select>
             </div>
             <div className="md:col-span-2">
@@ -1198,7 +1530,7 @@ export default function InventarioApp() {
                   </div>
                   {newTransaction.isShotMode ? (
                     <div className="flex items-center">
-                      <input required type="number" min="1" value={newTransaction.shotsCount} onChange={e => setNewTransaction({...newTransaction, shotsCount: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono" placeholder="Ej. 5 tragos" />
+                      <input required type="number" min="0.1" step="0.1" value={newTransaction.shotsCount} onChange={e => setNewTransaction({...newTransaction, shotsCount: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono" placeholder="Ej. 5.5 tragos" />
                       <span className="ml-2 text-xs text-gray-500 font-medium">tragos</span>
                     </div>
                   ) : (
@@ -1206,7 +1538,7 @@ export default function InventarioApp() {
                   )}
                 </div>
               ) : (
-                <input required type="number" step="1" min="1" value={newTransaction.quantity} onChange={e => setNewTransaction({...newTransaction, quantity: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono" placeholder="Unidades" />
+                <input required type="number" step="0.05" min="0.05" value={newTransaction.quantity} onChange={e => setNewTransaction({...newTransaction, quantity: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono" placeholder="Ej. 1.5 botellas" />
               )}
             </div>
             <div className="md:col-span-2">
@@ -1231,14 +1563,26 @@ export default function InventarioApp() {
             </div>
             <div className="md:col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-1">Producto Afectado</label>
+              <div className="relative mb-1.5">
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  value={writeOffItemSearch}
+                  onChange={e => setWriteOffItemSearch(e.target.value)}
+                  placeholder="Filtrar productos..."
+                  className="w-full pl-8 pr-2 py-1.5 border rounded-lg text-xs outline-none bg-white"
+                />
+              </div>
               <select required value={newWriteOff.itemId} onChange={e => setNewWriteOff({...newWriteOff, itemId: e.target.value})} className="w-full p-2.5 border rounded-xl outline-none bg-white">
                 <option value="" disabled>Seleccione producto...</option>
-                {items.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+                {items
+                  .filter(item => item.name.toLowerCase().includes(writeOffItemSearch.trim().toLowerCase()))
+                  .map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Botellas Rotas</label>
-              <input required type="number" step="0.25" min="0.25" value={newWriteOff.quantity} onChange={e => setNewWriteOff({...newWriteOff, quantity: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono bg-white" />
+              <input required type="number" step="0.05" min="0.05" value={newWriteOff.quantity} onChange={e => setNewWriteOff({...newWriteOff, quantity: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono bg-white" />
             </div>
             <div className="md:col-span-3">
               <label className="block text-sm font-medium text-gray-700 mb-1">Descripción del Accidente</label>
@@ -1263,6 +1607,7 @@ export default function InventarioApp() {
                   <th className="p-4 font-semibold text-center">Cantidad</th>
                   <th className="p-4 font-semibold">Registrado por</th>
                   <th className="p-4 font-semibold">Detalle / Nota</th>
+                  <th className="p-4 font-semibold text-center">Acciones</th>
                 </tr>
               </thead>
               <tbody>
@@ -1284,23 +1629,107 @@ export default function InventarioApp() {
                           <span className="flex items-center text-xs font-bold text-red-700 bg-red-100 px-2.5 py-1 rounded-lg w-max"><TrendingDown size={14} className="mr-1" /> SALIDA</span>
                         )}
                       </td>
-                      <td className="p-4 font-medium text-gray-800">{item ? item.name : 'Ítem'}</td>
+                      <td className="p-4 font-medium text-gray-800">{item ? item.name : 'Ítem (eliminado del catálogo)'}</td>
                       <td className={`p-4 text-center font-bold ${tx.type === 'IN' ? 'text-emerald-600' : 'text-red-600'}`}>
                         {tx.type === 'IN' ? '+' : '-'}{tx.quantity} bot.
                         {tx.isShotMode && tx.shotsCount && <span className="block text-xs font-normal text-indigo-600 font-mono">({tx.shotsCount} tragos)</span>}
                       </td>
                       <td className="p-4 text-xs text-gray-700 font-medium">{tx.user || '—'}</td>
                       <td className="p-4 text-xs text-gray-600">{tx.note}</td>
+                      <td className="p-4 text-center">
+                        <div className="flex items-center justify-center space-x-2">
+                          <button onClick={() => openEditTx(tx)} title="Corregir movimiento" className="p-2 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100 transition">
+                            <Pencil size={14} />
+                          </button>
+                          <button onClick={() => handleDeleteTx(tx)} title="Eliminar movimiento" className="p-2 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 transition">
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   );
                 })}
                 {transactions.length === 0 && (
-                  <tr><td colSpan="7" className="p-8 text-center text-gray-500">No hay movimientos registrados en el Kardex.</td></tr>
+                  <tr><td colSpan="8" className="p-8 text-center text-gray-500">No hay movimientos registrados en el Kardex.</td></tr>
                 )}
               </tbody>
             </table>
           </div>
         </div>
+
+        {editingTx && editTxForm && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+              <div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white rounded-t-2xl">
+                <h2 className="text-lg font-bold text-gray-800 flex items-center">
+                  <Pencil className="mr-2" size={20} /> Corregir Movimiento del Kardex
+                </h2>
+                <button onClick={closeEditTx} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500">
+                  <X size={20} />
+                </button>
+              </div>
+              <form onSubmit={handleSaveEditTx} className="p-6 space-y-4">
+                <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                  Al guardar, se revierte el efecto original de este movimiento sobre el stock y se aplica de nuevo con los valores corregidos.
+                </p>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Tipo de Movimiento</label>
+                  <div className="flex space-x-1">
+                    <button type="button" onClick={() => setEditTxForm({...editTxForm, type: 'IN'})} className={`flex-1 py-2 px-2 rounded-xl flex items-center justify-center font-bold text-xs transition ${editTxForm.type === 'IN' ? 'bg-emerald-600 text-white shadow' : 'bg-gray-100 text-gray-600'}`}><TrendingUp size={14} className="mr-1" /> Entrada</button>
+                    <button type="button" onClick={() => setEditTxForm({...editTxForm, type: 'OUT'})} className={`flex-1 py-2 px-2 rounded-xl flex items-center justify-center font-bold text-xs transition ${editTxForm.type === 'OUT' ? 'bg-red-600 text-white shadow' : 'bg-gray-100 text-gray-600'}`}><TrendingDown size={14} className="mr-1" /> Salida</button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Área</label>
+                  <select value={editTxForm.area} onChange={e => setEditTxForm({...editTxForm, area: e.target.value})} className="w-full p-2.5 border rounded-xl outline-none font-semibold bg-white">
+                    {AREAS.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Producto</label>
+                  <div className="relative mb-1.5">
+                    <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      value={editTxItemSearch}
+                      onChange={e => setEditTxItemSearch(e.target.value)}
+                      placeholder="Filtrar productos..."
+                      className="w-full pl-8 pr-2 py-1.5 border rounded-lg text-xs outline-none bg-white"
+                    />
+                  </div>
+                  <select required value={editTxForm.itemId} onChange={e => setEditTxForm({...editTxForm, itemId: e.target.value})} className="w-full p-2.5 border rounded-xl outline-none bg-white">
+                    {items
+                      .filter(item => item.name.toLowerCase().includes(editTxItemSearch.trim().toLowerCase()))
+                      .map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Cantidad (botellas/unidades)</label>
+                  <input required type="number" step="0.05" min="0.05" value={editTxForm.quantity} onChange={e => setEditTxForm({...editTxForm, quantity: e.target.value})} className="w-full p-2.5 border rounded-xl font-mono" />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Nota de corrección (opcional)</label>
+                  <input type="text" value={editTxForm.note} onChange={e => setEditTxForm({...editTxForm, note: e.target.value})} className="w-full p-2.5 border rounded-xl outline-none" placeholder="Ej. Se digitó 5 en vez de 0.5" />
+                </div>
+
+                <div className="flex justify-between items-center pt-2 border-t">
+                  <button type="button" onClick={() => handleDeleteTx(editingTx)} className="flex items-center text-red-600 hover:text-red-700 font-bold text-sm px-4 py-2.5 rounded-xl hover:bg-red-50 transition">
+                    <Trash2 size={16} className="mr-2" /> Eliminar
+                  </button>
+                  <div className="flex space-x-2">
+                    <button type="button" onClick={closeEditTx} className="px-6 py-2.5 rounded-xl border font-bold text-gray-700 hover:bg-gray-50 transition">Cancelar</button>
+                    <button type="submit" className="bg-blue-600 text-white px-6 py-2.5 rounded-xl hover:bg-blue-700 transition font-bold">Guardar Corrección</button>
+                  </div>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -1352,3 +1781,7 @@ export default function InventarioApp() {
     </div>
   );
 }
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
