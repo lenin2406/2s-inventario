@@ -1781,7 +1781,3 @@ export default function InventarioApp() {
     </div>
   );
 }
-
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
